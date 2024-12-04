@@ -1,6 +1,6 @@
 import polars as pl
 from sklearn.model_selection import StratifiedKFold, cross_val_predict, GridSearchCV
-from sklearn.metrics import precision_recall_curve, auc, accuracy_score, roc_auc_score, classification_report, confusion_matrix, make_scorer
+from sklearn.metrics import precision_recall_curve, auc, accuracy_score, roc_auc_score, classification_report, confusion_matrix, make_scorer, f1_score, average_precision_score
 from sklearn.pipeline import Pipeline
 import matplotlib.pyplot as plt
 from matplotlib_venn import venn3
@@ -15,27 +15,59 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 ##################################################################Preprocessing Functions##################################################################
 
 def preprocess_tax_df(df):
-    """_summary_
+    """Preprocesses the tax dataset and returns the features and target variable. Drops column c10 which is a recoding of the target variable. 
+    Recodes column n4 to be catergorical with 999 (missing) being 0 and 1 otherwise. Bins the 'i4' column into 4 bins. Drops columns i1, i2, i5, due to high correlation with i4.
 
     Parameters:
-        df (polars): _description_
+       - df (polars): Dataset to preprocess.
+        
+    Returns:
+       - X (polars): Preprocessed features.
+       - y (polars): Target variable.
     """
     
     #Drop c10 as it is a recoding of the target variable
     df = df.drop('c10')
     
     # Subset to categorical cols
-    cat_cols = [col for col in df_train.columns if df_train[col].dtype == pl.String]
+    cat_cols = [col for col in df.columns if df_train[col].dtype == pl.String]
     
     # Fill categorical cols missing vals with "missing"
-    df_train = df_train.with_columns(
+    df = df.with_columns(
         [pl.col(col).fill_null('missing').alias(col) for col in cat_cols]
     )
+    
+    # Replace specific missing value indicators with 'missing'
+    df = df.with_columns([
+        pl.when(pl.col('b1') == '-1').then(pl.lit('missing')).otherwise(pl.col('b1')).alias('b1'),
+        pl.when(pl.col('c3') == 'unknown').then(pl.lit('missing')).otherwise(pl.col('c3')).alias('c3'),
+        pl.when(pl.col('employment') == 'unknown').then(pl.lit('missing')).otherwise(pl.col('employment')).alias('employment')])
    
     
     #Recode column n4 to be catergorical with 999 (missing) being 0 and 1 otherwise
-    df_train = df_train.with_columns(pl.when(
+    df = df.with_columns(pl.when(
     pl.col('n4') == 999).then(0).otherwise(1).alias('n4_recoded'))
+    
+    
+    # Bin the 'i4' column into 4 bins
+    df = df.with_columns(
+        pl.when(pl.col("i4") <= 1.5)
+        .then(pl.lit("low"))
+        .when(pl.col("i4").is_between(1.5, 3.9))  
+        .then(pl.lit("medium"))
+        .when(pl.col("i4").is_between(3.9, 4.2))
+        .then(pl.lit("high_1"))
+        .otherwise(pl.lit("high_2"))
+        .alias("i4_binned")
+    )
+    
+    lb = LabelBinarizer()
+    y = lb.fit_transform(df['successful_sell'].to_numpy()).ravel() 
+
+    X = df.drop(['i1', 'i2' , 'i4', 'i5', 'n4', 'successful_sell'])
+    
+    return X, y  
+
     
     
     
@@ -64,7 +96,7 @@ def custom_cost(y_true, y_pred, tp_cost=1, tn_cost=0, fp_cost=-0.1, fn_cost=-1):
 
 
 
-def evaluate_models_with_thresholds(
+def evaluate_models_with_thresholds_old(
     models, X, y, preprocessor, n_splits=5, random_state=42,
     cost_params=None, thresholds=np.linspace(0.1, 0.9, 9), sampling_strategies=None
 ):
@@ -160,6 +192,103 @@ def evaluate_models_with_thresholds(
 
 
 
+
+
+
+def evaluate_models_with_thresholds(
+    models, X, y, preprocessor, n_splits=5, random_state=42,
+    cost_params=None, thresholds=np.linspace(0.1, 0.9, 9), sampling_strategies=None
+):
+    """
+    Evaluate multiple models with hyperparameter tuning using cross-validation,
+    optimize classification thresholds for custom cost function, and calculate costs.
+
+    Returns:
+    - results: dict, evaluation metrics, costs, optimal thresholds, and predictions for each model
+    """
+    if cost_params is None:
+        cost_params = {"tp_cost": 100, "tn_cost": 0, "fp_cost": -5, "fn_cost": -100}
+    if sampling_strategies is None:
+        sampling_strategies = [
+            None,
+            RandomOverSampler(random_state=random_state),
+            RandomUnderSampler(random_state=random_state)
+        ]
+
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    results = {}
+
+    for model_name, model, param_grid in models:
+        for sampler in sampling_strategies:
+            sampler_name = sampler.__class__.__name__ if sampler else "NoSampler"
+            pipeline = ImbPipeline([
+                ("preprocessor", preprocessor),
+                ("sampler", sampler if sampler else "passthrough"),
+                ("model", model)
+            ])
+
+            grid_search = GridSearchCV(
+                pipeline,
+                param_grid={"model__" + key: value for key, value in param_grid.items()},
+                cv=cv,
+                scoring='average_precision',  # Use average precision for hyperparameter tuning then optimize threshold using custom cost function
+                n_jobs=-1
+            )
+            grid_search.fit(X, y)
+
+            best_model = grid_search.best_estimator_
+
+            # Get cross-validated probabilities
+            probs = cross_val_predict(best_model, X, y, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+
+            # Optimize threshold based on custom cost
+            best_threshold = None
+            best_cost = float('-inf')
+            best_preds = None
+
+            for threshold in thresholds:
+                thresholded_preds = (probs >= threshold).astype(int)
+                cost = custom_cost(y, thresholded_preds, **cost_params)
+                if cost > best_cost:
+                    best_cost = cost
+                    best_threshold = threshold
+                    best_preds = thresholded_preds
+
+            # Feature importance
+            feature_importance = None
+            if hasattr(best_model.named_steps["model"], "feature_importances_"):
+                feature_importance = best_model.named_steps["model"].feature_importances_
+            elif hasattr(best_model.named_steps["model"], "coef_"):
+                feature_importance = np.abs(best_model.named_steps["model"].coef_).flatten()
+
+            # Confusion matrix
+            confusion_mat = confusion_matrix(y, best_preds)
+
+            # F1 score
+            f1 = f1_score(y, best_preds)
+            
+            average_precision = average_precision_score(y, probs)
+
+            # Store results
+            results[f"{model_name}_{sampler_name}"] = {
+                "best_params": grid_search.best_params_,
+                "best_threshold": best_threshold,
+                "total_profit": best_cost,
+                "average_profit_per_sample": best_cost / len(y),
+                "feature_importance": feature_importance,
+                "model": best_model,
+                "confusion_matrix": confusion_mat,
+                "F1": f1,
+                "average_precision_score": average_precision,
+                "probs": probs,  # Store probabilities
+                "best_preds": best_preds,  # Store thresholded predictions
+            }
+
+    return results
+
+
+
+
 def evaluate_models_across_ratios(models, X, y, preprocessor, ratios, n_splits=5, random_state=42, thresholds=np.linspace(0.1, 0.9, 9), sampling_strategies=None):
     """
     Evaluate models with different cost-to-revenue ratios.
@@ -223,6 +352,7 @@ def model_diagnostics(results):
         print(f"Confusion Matrix:")
         print(metrics['confusion_matrix'])
         print(f"F1 Score: {metrics['F1']:.2f}")
+        print(f"Average Precision Score: {metrics['average_precision_score']:.2f}")
         print("-" * 50)
 
 
