@@ -1,6 +1,7 @@
 import polars as pl
 from sklearn.model_selection import StratifiedKFold, cross_val_predict, GridSearchCV
 from sklearn.metrics import precision_recall_curve, auc, accuracy_score, roc_auc_score, classification_report, confusion_matrix, make_scorer, f1_score, average_precision_score
+from sklearn.preprocessing import LabelBinarizer
 from sklearn.pipeline import Pipeline
 import matplotlib.pyplot as plt
 from matplotlib_venn import venn3
@@ -30,7 +31,7 @@ def preprocess_tax_df(df):
     df = df.drop('c10')
     
     # Subset to categorical cols
-    cat_cols = [col for col in df.columns if df_train[col].dtype == pl.String]
+    cat_cols = [col for col in df.columns if df[col].dtype == pl.String]
     
     # Fill categorical cols missing vals with "missing"
     df = df.with_columns(
@@ -96,105 +97,6 @@ def custom_cost(y_true, y_pred, tp_cost=1, tn_cost=0, fp_cost=-0.1, fn_cost=-1):
 
 
 
-def evaluate_models_with_thresholds_old(
-    models, X, y, preprocessor, n_splits=5, random_state=42,
-    cost_params=None, thresholds=np.linspace(0.1, 0.9, 9), sampling_strategies=None
-):
-    """
-    Evaluate multiple models with hyperparameter tuning using cross-validation,
-    optimize classification thresholds for custom cost function, and calculate costs.
-
-    Returns:
-    - results: dict, evaluation metrics, costs, optimal thresholds, and predictions for each model
-    """
-    if cost_params is None:
-        cost_params = {"tp_cost": 100, "tn_cost": 0, "fp_cost": -5, "fn_cost": -100}
-    if sampling_strategies is None:
-        sampling_strategies = [None, RandomOverSampler(random_state=random_state), RandomUnderSampler(random_state=random_state)]
-
-    # Define the custom scoring function
-    def cost_scorer(y_true, y_pred):
-        return custom_cost(y_true, y_pred, **cost_params)
-
-    custom_scorer = make_scorer(cost_scorer, greater_is_better=True)
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    results = {}
-
-    for model_name, model, param_grid in models:
-        for sampler in sampling_strategies:
-            sampler_name = sampler.__class__.__name__ if sampler else "NoSampler"
-            pipeline = ImbPipeline([
-                ("preprocessor", preprocessor),
-                ("sampler", sampler if sampler else "passthrough"),
-                ("model", model)
-            ])
-
-            grid_search = GridSearchCV(
-                pipeline,
-                param_grid={"model__" + key: value for key, value in param_grid.items()},
-                cv=cv,
-                scoring=custom_scorer,
-                n_jobs=-1
-            )
-            grid_search.fit(X, y)
-
-            best_model = grid_search.best_estimator_
-
-            # Get cross-validated predictions
-            probs = cross_val_predict(best_model, X, y, cv=cv, method="predict_proba")[:, 1]
-            preds = cross_val_predict(best_model, X, y, cv=cv)  # Hard predictions
-            
-            # Optimize threshold based on custom cost
-            best_threshold = None
-            best_cost = float('-inf')
-            best_preds = None
-
-            for threshold in thresholds:
-                thresholded_preds = (probs >= threshold).astype(int)
-                cost = custom_cost(y, thresholded_preds, **cost_params)
-                if cost > best_cost:
-                    best_cost = cost
-                    best_threshold = threshold
-                    best_preds = thresholded_preds
-
-            # Feature importance
-            feature_importance = None
-            if hasattr(best_model.named_steps["model"], "feature_importances_"):
-                feature_importance = best_model.named_steps["model"].feature_importances_
-            elif hasattr(best_model.named_steps["model"], "coef_"):
-                feature_importance = np.abs(best_model.named_steps["model"].coef_).flatten()
-
-            # Confusion matrix
-            confusion_mat = confusion_matrix(y, best_preds)
-
-            # F1 score
-            f1 = (confusion_mat[1, 1]) / (
-                confusion_mat[1, 1] + (0.5 * (confusion_mat[0, 1] + confusion_mat[1, 0]))
-            )
-
-            # Store results
-            results[f"{model_name}_{sampler_name}"] = {
-                "best_params": grid_search.best_params_,
-                "best_threshold": best_threshold,
-                "total_profit": best_cost,
-                "average_profit_per_sample": best_cost / len(y),
-                "feature_importance": feature_importance,
-                "model": best_model,
-                "confusion_matrix": confusion_mat,
-                "F1": f1,
-                "probs": probs,  # Store probabilities
-                "best_preds": best_preds,  # Store thresholded predictions
-                "hard_preds": preds,  # Store cross-validated hard predictions
-            }
-
-    return results
-
-
-
-
-
-
-
 def evaluate_models_with_thresholds(
     models, X, y, preprocessor, n_splits=5, random_state=42,
     cost_params=None, thresholds=np.linspace(0.1, 0.9, 9), sampling_strategies=None
@@ -206,19 +108,26 @@ def evaluate_models_with_thresholds(
     Returns:
     - results: dict, evaluation metrics, costs, optimal thresholds, and predictions for each model
     """
+    
+    # Set default values of cost parameters and sampling strategies
     if cost_params is None:
-        cost_params = {"tp_cost": 100, "tn_cost": 0, "fp_cost": -5, "fn_cost": -100}
+        cost_params = {"tp_cost": 100, "tn_cost": 0, "fp_cost": -5, "fn_cost": 0}
+        
     if sampling_strategies is None:
+        
         sampling_strategies = [
             None,
             RandomOverSampler(random_state=random_state),
             RandomUnderSampler(random_state=random_state)
         ]
 
+    # Initialize cross-validation strategy and results dictionary
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     results = {}
 
+    # Iterate over models and sampling strategies with hyperparameter tuning using GridSearchCV
     for model_name, model, param_grid in models:
+        
         for sampler in sampling_strategies:
             sampler_name = sampler.__class__.__name__ if sampler else "NoSampler"
             pipeline = ImbPipeline([
@@ -231,12 +140,21 @@ def evaluate_models_with_thresholds(
                 pipeline,
                 param_grid={"model__" + key: value for key, value in param_grid.items()},
                 cv=cv,
-                scoring='average_precision',  # Use average precision for hyperparameter tuning then optimize threshold using custom cost function
-                n_jobs=-1
+                scoring='average_precision',  # Use average precision for hyperparameter tuning
+                n_jobs=-1,
+                return_train_score=True
             )
+            
+            # Fit the GridSearchCV object
             grid_search.fit(X, y)
 
+            # Pull best model from GridSearchCV using average precision as metric
             best_model = grid_search.best_estimator_
+
+            # Calculate cross-validation score variation for the best model
+            best_index = grid_search.best_index_
+            cv_scores = grid_search.cv_results_['mean_test_score']
+            cv_std = grid_search.cv_results_['std_test_score'][best_index]
 
             # Get cross-validated probabilities
             probs = cross_val_predict(best_model, X, y, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
@@ -246,15 +164,20 @@ def evaluate_models_with_thresholds(
             best_cost = float('-inf')
             best_preds = None
 
+            
             for threshold in thresholds:
+                
+                # If the probability is greater than the threshold, predict as positive
                 thresholded_preds = (probs >= threshold).astype(int)
                 cost = custom_cost(y, thresholded_preds, **cost_params)
+                
+                # If threshold increases profit, update best cost, threshold, and predictions
                 if cost > best_cost:
                     best_cost = cost
                     best_threshold = threshold
                     best_preds = thresholded_preds
 
-            # Feature importance
+            # Pull feature importance from the best model if available
             feature_importance = None
             if hasattr(best_model.named_steps["model"], "feature_importances_"):
                 feature_importance = best_model.named_steps["model"].feature_importances_
@@ -266,15 +189,17 @@ def evaluate_models_with_thresholds(
 
             # F1 score
             f1 = f1_score(y, best_preds)
-            
+
+            # Average precision
             average_precision = average_precision_score(y, probs)
 
             # Store results
             results[f"{model_name}_{sampler_name}"] = {
                 "best_params": grid_search.best_params_,
+                "cv_score_variation": cv_std,  # Standard deviation of CV scores
                 "best_threshold": best_threshold,
                 "total_profit": best_cost,
-                "average_profit_per_sample": best_cost / len(y),
+                "average_profit_per_sale_attempt": best_cost / (confusion_mat[1,1] + confusion_mat[0,1]),
                 "feature_importance": feature_importance,
                 "model": best_model,
                 "confusion_matrix": confusion_mat,
@@ -285,6 +210,7 @@ def evaluate_models_with_thresholds(
             }
 
     return results
+
 
 
 
@@ -347,12 +273,13 @@ def model_diagnostics(results):
         print(f"Model: {model_name}")
         print(f"Best Parameters: {metrics['best_params']}")
         print(f"Total Profit: {metrics['total_profit']:.2f}")
-        print(f"Average Profit per Sample: {metrics['average_profit_per_sample']:.2f}")
+        print(f"Average Profit per Sale Attempt: {metrics['average_profit_per_sale_attempt']:.2f}")
         print(f"Best Threshold: {metrics['best_threshold']:.2f}")
         print(f"Confusion Matrix:")
         print(metrics['confusion_matrix'])
         print(f"F1 Score: {metrics['F1']:.2f}")
         print(f"Average Precision Score: {metrics['average_precision_score']:.2f}")
+        print(f"CV Average Precision Variation (std): {metrics['cv_score_variation']:.3f}")
         print("-" * 50)
 
 
@@ -593,26 +520,3 @@ def visualize_error_overlap(misclassified_df, models):
     venn = venn3(sets, set_labels=models)
     plt.title("Overlap of Misclassified Instances")
     plt.show()
-
-
-
-def analyze_misclassified_features(misclassified_df, X, model_name):
-    """
-    Analyze feature distributions for misclassified instances.
-
-    Parameters:
-    - misclassified_df: DataFrame, output of error_analysis.
-    - X: DataFrame of input features.
-    - model_name: str, name of the model to analyze.
-
-    Returns:
-    - misclassified_features: DataFrame of misclassified feature statistics.
-    """
-    misclassified_indices = misclassified_df.index[misclassified_df[model_name] == 1]
-    misclassified_features = X.loc[misclassified_indices].describe()
-
-    print(f"Feature analysis for misclassified instances by {model_name}:")
-    print(misclassified_features)
-    return misclassified_features
-
-
